@@ -1,0 +1,728 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+#  RAMIĘ ROBOTYCZNE 5-DOF + CHWYTAK ZĘBATKOWY DO DRUKU 3D  –  makro FreeCAD 1.x
+# -----------------------------------------------------------------------------
+#  J1 obrót podstawy : NEMA 23 + przekł. planetarna 10:1 + pas HTD-5M 18T->72T
+#  J2 bark           : NEMA 23 + przekł. planetarna 30:1 (współosiowo) + łoż. 6005
+#  J3 łokieć         : NEMA 17 + przekł. planetarna 14:1 + pas HTD-3M 16T->48T
+#  J4 nadgarstek     : serwo DS3235 (35 kg·cm) w uchwycie + łożysko podporowe 623
+#  J5 obrót chwytaka : serwo DS3225 (25 kg·cm, 270°) + łożysko 6806
+#  Chwytak           : serwo DS3218/MG996R, zębnik m1.5 z20 + 2 zębatki,
+#                      szczęki prowadzone na 2 prętach Ø4, nakładki z TPU
+#  Okablowanie       : wiązki w oplocie, pętle serwisowe na każdym przegubie,
+#                      przepusty w płytach, uchwyty kabli na rurach
+#
+#  Samodzielnie: Makro -> Makra... -> ramie_robotyczne.FCMacro -> Wykonaj
+#  Jako moduł   : używane automatycznie przez lazik_kosmiczny.FCMacro
+#  Jednostki: mm.  Kąty: stopnie.
+# =============================================================================
+
+import math
+import os
+import FreeCAD as App
+import Part
+
+# ------------------------------- PARAMETRY ----------------------------------
+POZA_STARTOWA = "prezentacja"   # klucz ze słownika POZY
+ANIMACJA = False                 # True = pokaz ruchu (tylko GUI)
+EKSPORT_STL = True               # zapis części do druku do folderu STL_ramie
+
+L1 = 500.0              # oś barku -> oś łokcia
+L2 = 450.0              # oś łokcia -> oś nadgarstka
+H_BARK = 200.0          # oś barku nad powierzchnią montażu
+L_WR = 100.0            # oś nadgarstka -> kołnierz obrotu chwytaka
+GRUBOSC_POKLADU = 15.0  # blacha pokładu, pod którą wisi silnik J1
+
+# Chwytak
+MODUL = 1.5
+ZEBY = 20
+LUZ = 0.10              # luz międzyzębny pod druk 3D [mm]
+T_NAKLADKI = 3.0        # grubość nakładki TPU
+R_ZEBNIKA = MODUL * ZEBY / 2.0
+
+#            obrót   bark  łokieć nadgarstek obrót_chw. rozwarcie[mm]
+POZY = {
+    "prezentacja":  (30.0, 45.0, 70.0, 25.0, 0.0, 40.0),
+    "probka":       (-25.0, -18.0, 62.0, 10.0, 0.0, 50.0),
+    "transport":    (180.0, 50.0, 140.0, -85.0, 0.0, 0.0),
+    "wyprostowane": (0.0, 75.0, 15.0, -30.0, 90.0, 70.0),
+}
+LIMITY = [(-180, 180), (-40, 135), (-20, 150), (-90, 90), (-135, 135), (0, 70)]
+NAZWY_OSI = ["obrot J1", "bark J2", "lokiec J3", "nadgarstek J4", "obrot J5", "rozwarcie"]
+
+# Kolory
+ALU = (0.80, 0.81, 0.83)
+ALU_C = (0.42, 0.43, 0.47)
+STAL = (0.62, 0.63, 0.66)
+CZARNY = (0.07, 0.07, 0.08)
+SERWO = (0.10, 0.10, 0.13)
+DRUK = (0.95, 0.45, 0.05)        # PETG / ASA – pomarańczowy
+DRUK_B = (0.92, 0.92, 0.94)      # PETG – biały (szczęki, palce)
+TPU = (0.12, 0.12, 0.12)
+PAS = (0.14, 0.14, 0.14)
+OPLOT = (0.20, 0.20, 0.24)
+KABEL_CZ = (0.78, 0.12, 0.10)
+BIALY = (0.95, 0.95, 0.95)
+PCB = (0.05, 0.45, 0.20)
+OSLONA = (0.70, 0.85, 1.00)
+
+
+# ------------------------------ NARZĘDZIA -----------------------------------
+def V(x, y, z):
+    return App.Vector(x, y, z)
+
+
+def kostka(x0, x1, y0, y1, z0, z1):
+    return Part.makeBox(x1 - x0, y1 - y0, z1 - z0, V(x0, y0, z0))
+
+
+def walecX(r, x0, x1, y=0.0, z=0.0):
+    return Part.makeCylinder(r, x1 - x0, V(x0, y, z), V(1, 0, 0))
+
+
+def walecY(r, y0, y1, x=0.0, z=0.0):
+    return Part.makeCylinder(r, y1 - y0, V(x, y0, z), V(0, 1, 0))
+
+
+def walecZ(r, z0, z1, x=0.0, y=0.0):
+    return Part.makeCylinder(r, z1 - z0, V(x, y, z0), V(0, 0, 1))
+
+
+def obrot(xd, zd):
+    """Rotacja, która lokalną oś X kieruje na xd, a Z na zd."""
+    yd = zd.cross(xd)
+    return App.Rotation(xd, yd, zd, "ZXY")
+
+
+OS_Y = obrot(V(1, 0, 0), V(0, 1, 0))     # lokalne Z -> globalne +Y
+OS_X = obrot(V(0, 1, 0), V(1, 0, 0))     # lokalne Z -> globalne +X
+
+
+def przesun(ksztalt, poz, rot=None):
+    s = ksztalt.copy()
+    s.Placement = App.Placement(poz, rot or App.Rotation()).multiply(s.Placement)
+    return s
+
+
+def suma(lista):
+    lista = [k for k in lista if k is not None]
+    if len(lista) == 1:
+        return lista[0]
+    try:
+        return lista[0].fuse(lista[1:]).removeSplitter()
+    except Exception:
+        return Part.makeCompound(lista)
+
+
+def wytnij(ksztalt, narzedzia):
+    try:
+        return ksztalt.cut(narzedzia)
+    except Exception:
+        for n in narzedzia:
+            ksztalt = ksztalt.cut(n)
+        return ksztalt
+
+
+def fazuj_pionowe(b, r):
+    try:
+        kr = [e for e in b.Edges if len(e.Vertexes) == 2 and
+              abs(e.Vertexes[0].Point.z - e.Vertexes[1].Point.z) > 1e-6 and
+              abs(e.Vertexes[0].Point.x - e.Vertexes[1].Point.x) < 1e-6 and
+              abs(e.Vertexes[0].Point.y - e.Vertexes[1].Point.y) < 1e-6]
+        return b.makeChamfer(r, kr)
+    except Exception:
+        return b
+
+
+def zwoj(R, r, srodek, os_):
+    """Pętla serwisowa kabla wokół osi przegubu (torus)."""
+    return Part.makeTorus(R, r, srodek, os_)
+
+
+def kabel(punkty, r):
+    """Kabel/wiązka – profil kołowy przeciągnięty po krzywej BSpline."""
+    vs = [V(*p) for p in punkty]
+    try:
+        bs = Part.BSplineCurve()
+        bs.interpolate(vs)
+        e = bs.toShape()
+        t = e.tangentAt(e.FirstParameter)
+        prof = Part.Wire([Part.makeCircle(r, vs[0], t)])
+        s = Part.Wire([e]).makePipeShell([prof], True, True)
+        if s.isValid() and s.Volume > 0:
+            return s
+    except Exception:
+        pass
+    cz = []
+    for a, b in zip(vs[:-1], vs[1:]):
+        cz.append(Part.makeCylinder(r, (b - a).Length, a, App.Vector(b - a).normalize()))
+        cz.append(Part.makeSphere(r, b))
+    return Part.makeCompound(cz)
+
+
+def lozysko(d, D, B):
+    """Łożysko kulkowe (oś Z, z od 0 do B)."""
+    s = walecZ(D / 2, 0, B).cut(walecZ(d / 2, -1, B + 1))
+    a, b = d / 2 + (D - d) * 0.22, D / 2 - (D - d) * 0.22
+    for z0, z1 in ((-1, 0.4), (B - 0.4, B + 1)):
+        s = s.cut(walecZ(b, z0, z1).cut(walecZ(a, z0 - 1, z1 + 1)))
+    return s
+
+
+def kolo_pasowe(n, skok, szer, otwor, piasta=0.0):
+    """Koło zębate pasowe HTD (oś Z, wieniec z 0..szer, kołnierze po bokach)."""
+    pd = n * skok / math.pi
+    od = pd - (0.76 if skok < 4 else 1.14)
+    k = walecZ(od / 2, 0, szer)
+    rowki = [walecZ(skok * 0.28, -1, szer + 1,
+                    (od / 2 + skok * 0.12) * math.cos(2 * math.pi * i / n),
+                    (od / 2 + skok * 0.12) * math.sin(2 * math.pi * i / n)) for i in range(n)]
+    k = wytnij(k, rowki)
+    cz = [k, walecZ(od / 2 + 2.5, -1.2, 0), walecZ(od / 2 + 2.5, szer, szer + 1.2)]
+    if piasta:
+        cz.append(walecZ(max(od / 2 * 0.75, otwor / 2 + 4), szer + 1.2, szer + 1.2 + piasta))
+    return suma(cz).cut(walecZ(otwor / 2, -5, szer + piasta + 5))
+
+
+def obrys_pasa(c1, r1, c2, r2):
+    """Płaski obrys pasa opasującego dwa koła (płaszczyzna XY)."""
+    (x1, y1), (x2, y2) = c1, c2
+    dx, dy = x2 - x1, y2 - y1
+    d = math.hypot(dx, dy)
+    ux, uy = dx / d, dy / d
+    nx, ny = -uy, ux
+    phi = math.acos((r1 - r2) / d)
+
+    def e(sg):
+        return (ux * math.cos(phi) + sg * nx * math.sin(phi), uy * math.cos(phi) + sg * ny * math.sin(phi))
+
+    ep, em = e(1), e(-1)
+    P1p, P1m = V(x1 + r1 * ep[0], y1 + r1 * ep[1], 0), V(x1 + r1 * em[0], y1 + r1 * em[1], 0)
+    P2p, P2m = V(x2 + r2 * ep[0], y2 + r2 * ep[1], 0), V(x2 + r2 * em[0], y2 + r2 * em[1], 0)
+    M2, M1 = V(x2 + r2 * ux, y2 + r2 * uy, 0), V(x1 - r1 * ux, y1 - r1 * uy, 0)
+    kr = [Part.LineSegment(P1p, P2p).toShape(), Part.Arc(P2p, M2, P2m).toShape(),
+          Part.LineSegment(P2m, P1m).toShape(), Part.Arc(P1m, M1, P1p).toShape()]
+    return Part.Face(Part.Wire(kr))
+
+
+def pas(c1, r1, c2, r2, grub, szer):
+    zew = obrys_pasa(c1, r1 + grub, c2, r2 + grub).extrude(V(0, 0, szer))
+    wew = obrys_pasa(c1, r1, c2, r2).extrude(V(0, 0, szer))
+    return zew.cut(wew)
+
+
+def naped(typ, wal):
+    """Silnik krokowy + przekładnia planetarna. Wyjście w z=0, wałek w +Z."""
+    if typ == 23:
+        a, L = 56.4, 76.0
+        pk = suma([kostka(-30, 30, -30, 30, -10, 0), walecZ(30, -62, -10),
+                   kostka(-28.5, 28.5, -28.5, 28.5, -72, -62), walecZ(20, 0, 3)])
+        wal_ = suma([walecZ(7, 0, wal), kostka(-2.5, 2.5, 5, 8, 6, min(wal, 30))])
+        off = -72.0
+    else:
+        a, L = 42.3, 48.0
+        pk = suma([kostka(-21, 21, -21, 21, -6, 0), walecZ(18, -38, -6),
+                   kostka(-21, 21, -21, 21, -44, -38), walecZ(11, 0, 2)])
+        wal_ = walecZ(4, 0, wal).cut(kostka(-5, 5, 3.5, 5, 4, wal + 1))
+        off = -44.0
+
+    def blok(z0, z1):
+        return fazuj_pionowe(kostka(-a / 2, a / 2, -a / 2, a / 2, z0, z1), a * 0.09)
+
+    pokrywy = suma([blok(off - 8, off), blok(off - L, off - L + 8)])
+    korpus = blok(off - L + 8, off - 8)
+    if typ == 23:
+        zl = walecY(5.5, a / 2 - 1, a / 2 + 12, 0, off - L + 14)
+    else:
+        zl = kostka(-8, 8, a / 2 - 1, a / 2 + 5, off - L + 3, off - L + 13)
+    return [("przekladnia", pk, ALU_C), ("walek", wal_, STAL), ("silnik_pokrywy", pokrywy, ALU),
+            ("silnik", korpus, CZARNY), ("zlacze", zl, BIALY if typ == 17 else CZARNY)]
+
+
+def serwo():
+    """Serwo standardowe. Górna ścianka z=0, wałek w (0,0) w +Z, korpus w -Z."""
+    korpus = kostka(-10.25, 30.25, -10, 10, -37, 0)
+    uszy = kostka(-17, 37.25, -9.5, 9.5, -12.5, -10)
+    uszy = wytnij(uszy, [walecZ(1.6, -14, -8, x, y) for x in (-14.75, 34.75) for y in (-5, 5)])
+    return [("korpus", suma([korpus, uszy, walecZ(7, 0, 2)]), SERWO),
+            ("wielowypust", walecZ(3, 2, 6), STAL)]
+
+
+def orczyk():
+    o = walecZ(12.5, 4, 7)
+    return wytnij(o, [walecZ(1.1, 3, 8, 8 * math.cos(a), 8 * math.sin(a))
+                      for a in [math.radians(45 + 90 * i) for i in range(4)]] + [walecZ(1.6, 3, 8)])
+
+
+def zebnik(m, z, luz, x0, grub):
+    """Koło zębate ewolwentowe (kąt przyporu 20°) w płaszczyźnie YZ, oś X."""
+    alfa = math.radians(20)
+    rp = m * z / 2
+    rb, ra, rf = rp * math.cos(alfa), rp + m, rp - 1.25 * m
+    th_b = math.pi / (2 * z) - luz / (2 * rp) + (math.tan(alfa) - alfa)
+    ta = math.sqrt((ra / rb) ** 2 - 1)
+    flanka = [(rb * math.sqrt(1 + t * t), th_b - (t - math.atan(t))) for t in [ta * i / 8 for i in range(9)]]
+
+    def P(r, a):
+        return V(x0, r * math.cos(a), r * math.sin(a))
+
+    pts, krok = [], 2 * math.pi / z
+    for k in range(z):
+        c = math.pi / 2 + k * krok
+        pts.append(P(rf, c - th_b))
+        pts += [P(r, c - a) for r, a in flanka]
+        pts += [P(r, c + a) for r, a in reversed(flanka)]
+        pts.append(P(rf, c + th_b))
+        a0, a1 = c + th_b, c + krok - th_b
+        pts += [P(rf, a0 + (a1 - a0) * j / 3.0) for j in (1, 2)]
+    return Part.Face(Part.makePolygon(pts + [pts[0]])).extrude(V(grub, 0, 0))
+
+
+def zebatka(m, luz, y0, y1, z_podz, z_gora, x0, grub):
+    """Listwa zębata (zęby skierowane w -Z), linia podziałowa na z_podz, oś X = grubość."""
+    alfa = math.radians(20)
+    p = math.pi * m
+    hw = p / 4 - luz / 2
+    zt, zr = z_podz - m, z_podz + 1.25 * m
+    hw_t, hw_r = hw - m * math.tan(alfa), hw + 1.25 * m * math.tan(alfa)
+
+    def P(y, z):
+        return V(x0, y, z)
+
+    pts = [P(y0, z_gora), P(y0, zr)]
+    for k in range(int(math.ceil((y0 + hw_r - p / 2) / p)), int(math.floor((y1 - hw_r - p / 2) / p)) + 1):
+        yc = k * p + p / 2
+        pts += [P(yc - hw_r, zr), P(yc - hw_t, zt), P(yc + hw_t, zt), P(yc + hw_r, zr)]
+    pts += [P(y1, zr), P(y1, z_gora)]
+    return Part.Face(Part.makePolygon(pts + [pts[0]])).extrude(V(grub, 0, 0))
+
+
+def opaska(xc, a, y_k, r_k):
+    """Drukowany uchwyt kabla zakładany na rurę kwadratową a x a."""
+    t = 2.0
+    o = kostka(xc - 5, xc + 5, -a / 2 - t, a / 2 + t, -a / 2 - t, a / 2 + t).cut(
+        kostka(xc - 6, xc + 6, -a / 2, a / 2, -a / 2, a / 2))
+    pierscien = walecX(r_k + 2.5, xc - 5, xc + 5, y_k, 0)
+    most = kostka(xc - 5, xc + 5, y_k + r_k, -a / 2, -3, 3)
+    return suma([o, pierscien, most]).cut(walecX(r_k + 0.2, xc - 6, xc + 6, y_k, 0))
+
+
+# =============================================================================
+#  KLASA RAMIENIA
+# =============================================================================
+KLUCZE = ["p0", "p1", "p2", "p3", "p4", "p5", "szczA", "szczB", "zebnik"]
+GRUPY = {"p0": "J1_Podstawa", "p1": "J1_Obrotnica_J2_Bark", "p2": "Ramie_gorne_J3",
+         "p3": "Przedramie_J4", "p4": "Nadgarstek_J5", "p5": "Chwytak", "szczA": "Chwytak",
+         "szczB": "Chwytak", "zebnik": "Chwytak"}
+
+
+class Ramie(object):
+    def __init__(self, doc, baza=None, prefiks="R_", grupa_nadrz=None):
+        self.doc = doc
+        self.baza = baza or App.Placement()
+        self.prefiks = prefiks
+        self.obiekty = {k: [] for k in KLUCZE}
+        self.do_druku = []
+        self.grupa = doc.addObject("App::DocumentObjectGroup", prefiks + "Ramie_robotyczne")
+        if grupa_nadrz is not None:
+            grupa_nadrz.addObject(self.grupa)
+        self.podgrupy = {}
+        self.stan = list(POZY["prezentacja"])
+        self._timer = None
+        self._buduj()
+
+    # ------------------------------------------------------------------ obiekty
+    def _grupa(self, nazwa):
+        if nazwa not in self.podgrupy:
+            g = self.doc.addObject("App::DocumentObjectGroup", self.prefiks + nazwa)
+            self.grupa.addObject(g)
+            self.podgrupy[nazwa] = g
+        return self.podgrupy[nazwa]
+
+    def _dodaj(self, klucz, nazwa, ksztalt, kolor, przezr=0, grupa=None):
+        o = self.doc.addObject("Part::Feature", self.prefiks + nazwa)
+        o.Shape = ksztalt
+        self._grupa(grupa or GRUPY[klucz]).addObject(o)
+        if App.GuiUp:
+            o.ViewObject.ShapeColor = kolor
+            o.ViewObject.Transparency = przezr
+        self.obiekty[klucz].append((o, App.Placement(ksztalt.Placement)))
+        return o
+
+    def _dodaj_liste(self, klucz, prefiks, lista, poz, rot=None, grupa=None):
+        for nazwa, ksz, kol in lista:
+            self._dodaj(klucz, prefiks + "_" + nazwa, przesun(ksz, poz, rot), kol, grupa=grupa)
+
+    def _druk(self, plik, ksztalt, ilosc=1):
+        self.do_druku.append((plik, ksztalt, ilosc))
+
+    # ------------------------------------------------------------------ budowa
+    def _buduj(self):
+        self._podstawa()
+        self._obrotnica()
+        self._ramie_gorne()
+        self._przedramie()
+        self._nadgarstek()
+        self._chwytak()
+        self._okablowanie()
+
+    def _podstawa(self):
+        k = "p0"
+        CM = 104.0                       # rozstaw osi silnika J1 od osi obrotu
+        plyta = walecZ(135, 0, 8)
+        otw = [walecZ(25, -1, 9), walecZ(21, -1, 9, -CM, 0)]
+        sruby = []
+        for i in range(8):
+            a = math.radians(22.5 + 45 * i)
+            otw.append(walecZ(3.3, -1, 9, 120 * math.cos(a), 120 * math.sin(a)))
+            sruby.append(walecZ(5, 8, 12, 120 * math.cos(a), 120 * math.sin(a)))
+        self._dodaj(k, "J1_Plyta_bazowa_Al8", wytnij(plyta, otw), ALU)
+        self._dodaj(k, "J1_Sruby_M6", suma(sruby), STAL)
+        self._dodaj(k, "J1_Slupek_drazony", walecZ(35, 8, 46).cut(walecZ(25, 7, 47)), ALU)
+        self._dodaj(k, "J1_Lozyska_61814", suma([przesun(lozysko(70, 90, 10), V(0, 0, 12)),
+                                                przesun(lozysko(70, 90, 10), V(0, 0, 34))]), STAL)
+        self._dodaj_liste(k, "J1_Naped_NEMA23", naped(23, 45), V(-CM, 0, -GRUBOSC_POKLADU))
+        self._dodaj(k, "J1_Kolo_HTD5M_18T", przesun(kolo_pasowe(18, 5, 15, 14, 8), V(-CM, 0, 12)), ALU)
+        od18, od72 = 18 * 5 / math.pi - 1.14, 72 * 5 / math.pi - 1.14
+        self._dodaj(k, "J1_Pas_HTD5M_450", przesun(pas((0, 0), od72 / 2, (-CM, 0), od18 / 2, 3.6, 15),
+                                                   V(0, 0, 12)), PAS)
+
+    def _obrotnica(self):
+        k = "p1"
+        od72 = 72 * 5 / math.pi - 1.14
+        kolo = kolo_pasowe(72, 5, 15, 90)
+        kolo = suma([przesun(kolo, V(0, 0, 12)), walecZ(52, 28.2, 48)]).cut(walecZ(45, 0, 50))
+        self._dodaj(k, "J1_Kolo_HTD5M_72T_piasta", kolo, ALU)
+        self._dodaj(k, "J1_Tarcza_obrotowa_Al10", walecZ(85, 48, 58).cut(walecZ(20, 47, 59)), ALU)
+
+        def plyta(y0, y1):
+            return suma([kostka(-55, 55, y0, y1, 58, H_BARK), walecY(55, y0, y1, 0, H_BARK)])
+
+        przepust = lambda y0, y1: walecY(11, y0 - 1, y1 + 1, -25, 100)
+        pl_L = wytnij(plyta(43, 53), [walecY(23.5, 42, 54, 0, H_BARK), przepust(43, 53)])
+        pl_P = wytnij(plyta(-53, -43), [walecY(21, -54, -42, 0, H_BARK), przepust(-53, -43)] +
+                      [walecY(2.75, -54, -42, x, H_BARK + z) for x in (-23.5, 23.5) for z in (-23.5, 23.5)])
+        self._dodaj(k, "J2_Plyta_lewa_Al10", pl_L, ALU)
+        self._dodaj(k, "J2_Plyta_prawa_Al10", pl_P, ALU)
+        self._dodaj(k, "J2_Katowniki_i_mostek", suma([kostka(-40, 40, 33, 43, 58, 70),
+                                                      kostka(-40, 40, -43, -33, 58, 70),
+                                                      kostka(-55, -45, -43, 43, 58, 140)]), ALU_C)
+        self._dodaj(k, "J2_Przepusty_gumowe", suma([walecY(11, 42, 54, -25, 100).cut(walecY(7, 41, 55, -25, 100)),
+                                                    walecY(11, -54, -42, -25, 100).cut(walecY(7, -55, -41, -25, 100))]), CZARNY)
+        self._dodaj_liste(k, "J2_Naped_NEMA23_30to1", naped(23, 28), V(0, -53, H_BARK), OS_Y)
+        self._dodaj(k, "J2_Lozysko_6005", przesun(lozysko(25, 47, 12), V(0, 42, H_BARK), OS_Y), STAL)
+        oslona = walecY(28, 53, 65, 0, H_BARK).cut(walecY(25, 52, 63, 0, H_BARK))
+        self._dodaj(k, "J2_Oslona_enkodera", oslona, DRUK)
+        self._dodaj(k, "J2_Enkoder_AS5600", kostka(-11.5, 11.5, 60, 61.6, H_BARK - 11.5, H_BARK + 11.5), PCB)
+        self._druk("oslona_enkodera_J2.stl", oslona)
+
+    def _ramie_gorne(self):
+        k = "p2"
+        self._dodaj(k, "J2_Piasta_barku", suma([walecY(40, -40, 40), kostka(0, 75, -26, 26, -26, 26)]), ALU)
+        self._dodaj(k, "J2_Czop_barku", walecY(12.5, 40, 56), STAL)
+        rura = kostka(35, L1 - 80, -20, 20, -20, 20).cut(kostka(34, L1 - 79, -17, 17, -17, 17))
+        self._dodaj(k, "Rura_40x40x3", rura, ALU)
+        self._dodaj(k, "J3_Blok_widelca", kostka(L1 - 115, L1 - 75, -42, 42, -28, 28), ALU)
+        pl_P = suma([kostka(L1 - 115, L1, -42, -34, -30, 30), walecY(30, -42, -34, L1, 0)])
+        pl_P = pl_P.cut(walecY(16, -43, -33, L1, 0))
+        szczelina = suma([walecY(12, 33, 43, L1 - 163, 48), walecY(12, 33, 43, L1 - 157, 48),
+                          kostka(L1 - 163, L1 - 157, 33, 43, 36, 60)])
+        pl_L = suma([kostka(L1 - 205, L1, 34, 42, -30, 30), kostka(L1 - 190, L1 - 130, 34, 42, 20, 76),
+                     walecY(30, 34, 42, L1, 0)])
+        pl_L = wytnij(pl_L, [walecY(16, 33, 43, L1, 0), szczelina])
+        self._dodaj(k, "J3_Plyta_widelca_prawa_Al8", pl_P, ALU)
+        self._dodaj(k, "J3_Plyta_widelca_i_silnika_Al8", pl_L, ALU)
+        self._dodaj(k, "J3_Dystans", kostka(L1 - 205, L1 - 120, 20, 34, -15, 15), ALU_C)
+        self._dodaj_liste(k, "J3_Naped_NEMA17_14to1", naped(17, 22), V(L1 - 160, 34, 48), OS_Y)
+        self._dodaj(k, "J3_Kolo_HTD3M_16T", przesun(kolo_pasowe(16, 3, 9, 8), V(L1 - 160, 44.5, 48), OS_Y), ALU)
+        od16, od48 = 16 * 3 / math.pi - 0.76, 48 * 3 / math.pi - 0.76
+        c1, c2 = (L1 - 160, 48), (L1, 0)
+        rot_xz = App.Rotation(V(1, 0, 0), 90)            # płaszczyzna XY -> XZ
+        self._dodaj(k, "J3_Pas_HTD3M_9mm", przesun(pas(c1, od16 / 2, c2, od48 / 2, 2.4, 9),
+                                                   V(0, 53.5, 0), rot_xz), PAS)
+        osl = obrys_pasa(c1, od16 / 2 + 7, c2, od48 / 2 + 7).extrude(V(0, 0, 15.5)).cut(
+            obrys_pasa(c1, od16 / 2 + 4.5, c2, od48 / 2 + 4.5).extrude(V(0, 0, 13.5)))
+        osl = przesun(osl, V(0, 42.5, 0), App.Rotation(V(1, 0, 0), -90))
+        self._dodaj(k, "J3_Oslona_paska_przezr", osl, OSLONA, przezr=65)
+        self._druk("oslona_paska_J3.stl", osl)
+        self._dodaj(k, "J3_Lozyska_6002", suma([przesun(lozysko(15, 32, 9), V(L1, 33, 0), OS_Y),
+                                                przesun(lozysko(15, 32, 9), V(L1, -42, 0), OS_Y)]), STAL)
+        oslona = walecY(22, -54, -42, L1, 0).cut(walecY(19, -52, -41, L1, 0))
+        self._dodaj(k, "J3_Oslona_enkodera", oslona, DRUK)
+        self._dodaj(k, "J3_Enkoder_AS5600", kostka(L1 - 11.5, L1 + 11.5, -50, -48.4, -11.5, 11.5), PCB)
+        self._druk("oslona_enkodera_J3.stl", oslona)
+        for xc in (150, 260):
+            op = opaska(xc, 40, -28, 5)
+            self._dodaj(k, "Uchwyt_kabla_%d" % xc, op, DRUK, grupa="Okablowanie")
+        self._druk("uchwyt_kabla_rura40.stl", opaska(0, 40, -28, 5), 2)
+
+    def _przedramie(self):
+        k = "p3"
+        self._dodaj(k, "J3_Piasta_lokcia", suma([walecY(32, -32, 32), kostka(0, 60, -21, 21, -21, 21)]), ALU)
+        self._dodaj(k, "J3_Os_lokcia_15", walecY(7.5, -46, 56), STAL)
+        self._dodaj(k, "J3_Kolo_HTD3M_48T", przesun(kolo_pasowe(48, 3, 9, 15), V(0, 44.5, 0), OS_Y), ALU)
+        rura = kostka(45, L2 - 55, -15, 15, -15, 15).cut(kostka(44, L2 - 54, -13, 13, -13, 13))
+        self._dodaj(k, "Rura_30x30x2", rura, ALU)
+        uchwyt = kostka(L2 - 70, L2 + 19, -21, 7.5, -14, 14)
+        uchwyt = wytnij(uchwyt, [kostka(L2 - 30.6, L2 + 10.6, -17.6, 8, -10.3, 10.3),
+                                 kostka(L2 - 71, L2 - 54, -15.2, 15.2, -15.2, 15.2),
+                                 walecY(1.6, -22, -16, L2, 0)])
+        self._dodaj(k, "J4_Uchwyt_serwa", uchwyt, DRUK)
+        self._druk("przedramie_uchwyt_serwa_J4.stl", uchwyt)
+        self._dodaj_liste(k, "J4_Serwo_DS3235", serwo(), V(L2, 20, 0), obrot(V(-1, 0, 0), V(0, 1, 0)))
+        self._dodaj(k, "J4_Lozysko_623", przesun(lozysko(3, 10, 4), V(L2, -25, 0), OS_Y), STAL)
+        for xc in (150, 280):
+            self._dodaj(k, "Uchwyt_kabla_p%d" % xc, opaska(xc, 30, -27, 4), DRUK, grupa="Okablowanie")
+        self._druk("uchwyt_kabla_rura30.stl", opaska(0, 30, -27, 4), 2)
+
+    def _nadgarstek(self):
+        k = "p4"
+        ram_L = suma([walecY(16, 27, 31), kostka(0, 44, 27, 31, -16, 16)])
+        ram_P = suma([walecY(16, -29, -25), kostka(0, 44, -29, -25, -16, 16)])
+        klamra = suma([ram_L, ram_P, kostka(40, 44, -29, 31, -22, 22)])
+        klamra = wytnij(klamra, [walecY(1.6, -30, -24), walecY(5, 26, 32)] +
+                        [walecX(1.6, 39, 45, y, z) for y in (-5, 25) for z in (-8, 8)])
+        self._dodaj(k, "J4_Klamra_U_Al3", klamra, ALU)
+        self._dodaj(k, "J4_Orczyk_25T", przesun(orczyk(), V(0, 20, 0), obrot(V(-1, 0, 0), V(0, 1, 0))), ALU)
+        self._dodaj(k, "J4_Sworzen_M3", walecY(1.5, -29, -21), STAL)
+        self._dodaj_liste(k, "J5_Serwo_DS3225", serwo(), V(81, 0, 0), obrot(V(0, 1, 0), V(1, 0, 0)))
+        ob = suma([kostka(44, 84, -21, 41, -14, 14), walecX(25, 84, 100)])
+        ob = wytnij(ob, [kostka(43, 82, -10.6, 30.6, -10.4, 10.4), kostka(68.2, 71.3, -17.4, 37.6, -9.8, 9.8),
+                         walecX(21, 92, 101), walecX(16, 81, 93)] +
+                    [walecX(1.6, 43, 50, y, z) for y in (-5, 25) for z in (-8, 8)])
+        self._dodaj(k, "J5_Obudowa_obrotu", ob, DRUK)
+        self._druk("nadgarstek_obudowa_obrotu_J5.stl", ob)
+        self._dodaj(k, "J5_Lozysko_6806", przesun(lozysko(30, 42, 7), V(92, 0, 0), OS_X), STAL)
+
+    def _chwytak(self):
+        k = "p5"
+        W = 62.0
+        ob = suma([kostka(0, 5, -W, W, -34, 44),                                   # tył
+                   kostka(0, 75, W - 6, W, -34, 44), kostka(0, 75, -W, -W + 6, -34, 44),   # ściany
+                   kostka(0, 75, -W, W, -34, -30),                                 # dno
+                   kostka(0, 26.5, -W, W, 40, 44),                                 # góra
+                   kostka(26.5, 30.5, -W + 6, W - 6, -34, 44),                     # płyta serwa
+                   walecX(15, -16, 0)])                                            # piasta obrotu
+        otw = [walecX(13, -17, -12), walecX(3.5, -17, 6), walecX(5, -1, 6, 0, -25),
+               kostka(25.5, 31.5, -10.4, 10.4, -10.6, 30.6),
+               kostka(38, 62, -W - 1, W + 1, -18, 12)]
+        otw += [walecX(1.6, 25.5, 31.5, y, z) for y in (-5, 5) for z in (-14.75, 34.75)]
+        otw += [walecY(1.95, -W - 1, W + 1, 68, z) for z in (-20, 20)]
+        otw += [walecX(1.1, -17, -2, 8 * math.cos(a), 8 * math.sin(a))
+                for a in [math.radians(45 + 90 * i) for i in range(4)]]
+        ob = wytnij(ob, otw)
+        self._dodaj(k, "Chwytak_Obudowa", ob, DRUK)
+        self._druk("chwytak_obudowa.stl", ob)
+        self._dodaj_liste(k, "Chwytak_Serwo_DS3218", serwo(), V(43, 0, 0), obrot(V(0, 0, 1), V(1, 0, 0)))
+        self._dodaj(k, "Chwytak_Prety_4mm", suma([walecY(2, -W, W, 68, z) for z in (-20, 20)]), STAL)
+        self._dodaj(k, "J5_Orczyk_25T", przesun(orczyk(), V(-19, 0, 0), OS_X), ALU)
+
+        # --- zębnik (obraca się) + orczyk serwa chwytaka
+        z = zebnik(MODUL, ZEBY, LUZ, 50, 8)
+        z = wytnij(z, [walecX(3.5, 49, 59)] + [walecX(1.2, 49, 59, 8 * math.cos(a), 8 * math.sin(a))
+                                                for a in [math.radians(45 + 90 * i) for i in range(4)]])
+        self._dodaj("zebnik", "Chwytak_Zebnik_m1.5_z20", z, DRUK_B)
+        self._dodaj("zebnik", "Chwytak_Orczyk", przesun(orczyk(), V(43, 0, 0), OS_X), ALU)
+        self._druk("chwytak_zebnik_m1.5_z20.stl", z)
+
+        # --- szczęka (jedna część drukowana 2x; druga obrócona o 180° wokół X)
+        zr = R_ZEBNIKA + 1.25 * MODUL
+        baza = suma([kostka(59, 76, 0, 16, -28, 28),
+                     kostka(50, 60, 0, 16, zr, 28),
+                     zebatka(MODUL, LUZ, -52, 16, R_ZEBNIKA, 25, 50, 8.5)])
+        baza = wytnij(baza, [walecY(2.25, -1, 17, 68, z) for z in (-20, 20)] +
+                      [walecX(2.1, 69, 77, 12, z) for z in (-14, 14)])
+        palec = suma([kostka(76, 82, 0, 16, -28, 28),
+                      Part.Face(Part.makePolygon([V(82, 0, -24), V(146, 0, -12), V(146, 0, 12),
+                                                  V(82, 0, 24), V(82, 0, -24)])).extrude(V(0, 8, 0))])
+        palec = wytnij(palec, [walecX(1.7, 75, 83, 12, z) for z in (-14, 14)] +
+                       [walecX(3.0, 79.5, 83, 12, z) for z in (-14, 14)])
+        nakl = kostka(98, 144, -T_NAKLADKI, 0, -11, 11)
+        nakl = wytnij(nakl, [kostka(x, x + 1.2, -T_NAKLADKI - 0.1, -T_NAKLADKI + 1.0, -12, 12)
+                             for x in [100 + 4 * i for i in range(11)]])
+        for kk, lit in (("szczA", "A"), ("szczB", "B")):
+            self._dodaj(kk, "Chwytak_Szczeka_%s" % lit, baza, DRUK_B)
+            self._dodaj(kk, "Chwytak_Palec_%s" % lit, palec, DRUK)
+            self._dodaj(kk, "Chwytak_Nakladka_TPU_%s" % lit, nakl, TPU)
+        self._druk("chwytak_szczeka_baza_x2.stl", baza, 2)
+        self._druk("chwytak_palec_x2.stl", palec, 2)
+        self._druk("chwytak_nakladka_TPU_x2.stl", nakl, 2)
+
+    def _okablowanie(self):
+        g = "Okablowanie"
+        self._dodaj("p0", "Kabel_z_kadluba", walecZ(5, -80, 30), OPLOT, grupa=g)
+        self._dodaj("p1", "Kabel_glowny_J1", kabel([(0, 0, 29), (0, 0, 70), (-15, 25, 90), (-25, 48, 100),
+                                                     (-30, 68, 125), (-25, 75, H_BARK - 43.3)], 5), OPLOT, grupa=g)
+        self._dodaj("p1", "Kabel_silnika_J2", kabel([(0, 0, 70), (0, -25, 85), (-25, -48, 100), (-20, -75, 130),
+                                                      (-5, -110, 160), (0, -165, 165)], 4), KABEL_CZ, grupa=g)
+        self._dodaj("p2", "Petla_serwisowa_bark", zwoj(50, 5, V(0, 75, 0), V(0, 1, 0)), OPLOT, grupa=g)
+        self._dodaj("p2", "Kabel_ramie", kabel([(25, 75, 43.3), (70, 62, 40), (110, 10, 30), (150, -28, 12),
+                                                (250, -28, 0), (L1 - 140, -28, 0), (L1 - 118, -48, 0),
+                                                (L1 - 80, -55, 0), (L1 - 40, -64, 0)], 5), OPLOT, grupa=g)
+        self._dodaj("p2", "Kabel_silnika_J3", kabel([(270, -28, 0), (300, -45, 15), (330, -62, 35),
+                                                     (L1 - 160, -62, 48)], 3.5), KABEL_CZ, grupa=g)
+        self._dodaj("p3", "Petla_serwisowa_lokiec", zwoj(40, 4.5, V(0, -64, 0), V(0, 1, 0)), OPLOT, grupa=g)
+        self._dodaj("p3", "Kabel_przedramie", kabel([(40, -64, 0), (80, -45, 0), (130, -27, 0), (L2 - 120, -27, 0),
+                                                     (L2 - 60, -33, 0), (L2 - 22, -36, 0)], 4), OPLOT, grupa=g)
+        self._dodaj("p3", "Kabel_serwa_J4", kabel([(300, -27, 0), (L2 - 100, -28, -10), (L2 - 75, -24, -10),
+                                                   (L2 - 71, -21.5, -10)], 2.5), KABEL_CZ, grupa=g)
+        self._dodaj("p4", "Petla_serwisowa_nadgarstek", zwoj(22, 3.5, V(0, -36, 0), V(0, 1, 0)), OPLOT, grupa=g)
+        self._dodaj("p4", "Kabel_nadgarstek", kabel([(22, -36, 0), (36, -36, -12), (50, -30, -30),
+                                                     (62, -14, -46)], 3), OPLOT, grupa=g)
+        self._dodaj("p4", "Zwoj_obrotu_J5", zwoj(48, 3, V(62, 0, 0), V(1, 0, 0)), OPLOT, grupa=g)
+        self._dodaj("p5", "Kabel_chwytaka", kabel([(-38, 0, -48), (-24, 0, -45), (-10, 0, -36), (-3, 0, -29),
+                                                   (3, 0, -26)], 2.5), KABEL_CZ, grupa=g)
+
+    # ------------------------------------------------------------------ ruch
+    def kinematyka(self, q):
+        obr, bark, lok, nad, rol, roz = q
+        P, R = App.Placement, App.Rotation
+        p = {"p0": self.baza}
+        p["p1"] = p["p0"].multiply(P(V(0, 0, 0), R(V(0, 0, 1), obr)))
+        p["p2"] = p["p1"].multiply(P(V(0, 0, H_BARK), R(V(0, 1, 0), -bark)))
+        p["p3"] = p["p2"].multiply(P(V(L1, 0, 0), R(V(0, 1, 0), lok)))
+        p["p4"] = p["p3"].multiply(P(V(L2, 0, 0), R(V(0, 1, 0), nad)))
+        p["p5"] = p["p4"].multiply(P(V(L_WR, 0, 0), R(V(1, 0, 0), rol)))
+        s = roz / 2.0 + T_NAKLADKI                        # położenie wewn. ścianki wózka
+        p["szczA"] = p["p5"].multiply(P(V(0, s, 0), R()))
+        p["szczB"] = p["p5"].multiply(P(V(0, -s, 0), R(V(1, 0, 0), 180)))
+        p["zebnik"] = p["p5"].multiply(P(V(0, 0, 0), R(V(1, 0, 0), -math.degrees(s / R_ZEBNIKA))))
+        return p
+
+    def ustaw(self, obrot_=None, bark=None, lokiec=None, nadgarstek=None, obrot_chw=None, rozwarcie=None):
+        """Ustawia pozę ramienia. Pominięte argumenty zostają bez zmian."""
+        nowe = [obrot_, bark, lokiec, nadgarstek, obrot_chw, rozwarcie]
+        for i, v in enumerate(nowe):
+            if v is None:
+                continue
+            lo, hi = LIMITY[i]
+            if v < lo or v > hi:
+                App.Console.PrintWarning("Ramie: %s=%.1f poza zakresem [%g, %g] - przycinam\n" % (NAZWY_OSI[i], v, lo, hi))
+                v = min(max(v, lo), hi)
+            self.stan[i] = float(v)
+        p = self.kinematyka(self.stan)
+        for klucz, lista in self.obiekty.items():
+            for o, lpl in lista:
+                o.Placement = p[klucz].multiply(lpl)
+        return p
+
+    def poza(self, nazwa):
+        return self.ustaw(*POZY[nazwa])
+
+    def punkt_chwytu(self):
+        """Środek między nakładkami szczęk (współrzędne globalne)."""
+        return self.kinematyka(self.stan)["p5"].multVec(V(121, 0, 0))
+
+    def animuj(self, sekwencja=None, krok=0.012, interwal=30):
+        try:
+            from PySide import QtCore
+        except ImportError:
+            try:
+                from PySide6 import QtCore
+            except ImportError:
+                from PySide2 import QtCore
+        import FreeCADGui as Gui
+        sek = sekwencja or [POZY["transport"], POZY["wyprostowane"], POZY["prezentacja"],
+                            POZY["probka"], POZY["transport"]]
+        st = {"t": 0.0}
+
+        def _krok():
+            n = len(sek) - 1
+            i = int(st["t"]) % n
+            u = st["t"] - int(st["t"])
+            u = 0.5 - 0.5 * math.cos(math.pi * u)
+            a, b = sek[i], sek[i + 1]
+            self.ustaw(*[a[j] + (b[j] - a[j]) * u for j in range(6)])
+            Gui.updateGui()
+            st["t"] += krok
+
+        self.zatrzymaj()
+        self._timer = QtCore.QTimer()
+        self._timer.timeout.connect(_krok)
+        self._timer.start(interwal)
+
+    def zatrzymaj(self):
+        if self._timer is not None:
+            self._timer.stop()
+            self._timer = None
+
+    # ------------------------------------------------------------------ STL
+    def eksportuj_stl(self, katalog):
+        try:
+            import MeshPart
+        except ImportError:
+            MeshPart = None
+        os.makedirs(katalog, exist_ok=True)
+        rotacje = [App.Rotation(), App.Rotation(V(1, 0, 0), 90), App.Rotation(V(1, 0, 0), -90),
+                   App.Rotation(V(1, 0, 0), 180), App.Rotation(V(0, 1, 0), 90), App.Rotation(V(0, 1, 0), -90)]
+        zapisane = []
+        for plik, ksz, ilosc in self.do_druku:
+            # orientacja do druku: największa płaska ściana na stole
+            najl, best = -1.0, None
+            for r in rotacje:
+                s = przesun(ksz, V(0, 0, 0), r)
+                zmin = s.BoundBox.ZMin
+                pole = 0.0
+                for f in s.Faces:
+                    try:
+                        if f.Surface.TypeId == "Part::GeomPlane":
+                            n = f.normalAt(0, 0)
+                            if n.z < -0.999 and abs(f.BoundBox.ZMax - zmin) < 1e-3:
+                                pole += f.Area
+                    except Exception:
+                        pass
+                if pole > najl:
+                    najl, best = pole, s
+            bb = best.BoundBox
+            best = przesun(best, V(-bb.Center.x, -bb.Center.y, -bb.ZMin))
+            sciezka = os.path.join(katalog, plik)
+            if MeshPart is not None:
+                m = MeshPart.meshFromShape(Shape=best, LinearDeflection=0.02, AngularDeflection=0.087, Relative=False)
+                m.write(sciezka)
+            else:
+                best.exportStl(sciezka)
+            zapisane.append(plik)
+        return zapisane
+
+
+def zbuduj_ramie(doc, baza=None, poza=None, prefiks="R_", grupa_nadrz=None):
+    r = Ramie(doc, baza, prefiks, grupa_nadrz)
+    r.poza(poza or POZA_STARTOWA)
+    return r
+
+
+# =============================================================================
+#  URUCHOMIENIE SAMODZIELNE
+# =============================================================================
+if not globals().get("RAMIE_JAKO_MODUL", False):
+    NAZWA_DOK = "Ramie_robotyczne"
+    if NAZWA_DOK in App.listDocuments():
+        App.closeDocument(NAZWA_DOK)
+    dok = App.newDocument(NAZWA_DOK)
+    pokl = dok.addObject("Part::Feature", "Poklad_demo")
+    pokl.Shape = kostka(-300, 300, -300, 300, -GRUBOSC_POKLADU, 0).cut(walecZ(25, -20, 5)).cut(
+        kostka(-134, -74, -30, 30, -20, 5))
+    if App.GuiUp:
+        pokl.ViewObject.ShapeColor = (0.5, 0.5, 0.52)
+        pokl.ViewObject.Transparency = 40
+    RAMIE = zbuduj_ramie(dok)
+    dok.recompute()
+
+    if EKSPORT_STL:
+        try:
+            _kat = os.path.dirname(os.path.abspath(__file__))
+        except NameError:
+            _kat = os.path.join(os.path.expanduser("~"), "CAD")
+        _stl = os.path.join(_kat, "STL_ramie")
+        _pliki = RAMIE.eksportuj_stl(_stl)
+        App.Console.PrintMessage("Zapisano %d plikow STL w %s\n" % (len(_pliki), _stl))
+
+    if App.GuiUp:
+        import FreeCADGui as Gui
+        Gui.activeDocument().activeView().viewIsometric()
+        Gui.SendMsgToActiveView("ViewFit")
+        if ANIMACJA:
+            RAMIE.animuj()
+            App.Console.PrintMessage("Animacja: zatrzymaj wpisujac RAMIE.zatrzymaj()\n")
+    App.Console.PrintMessage("Ramie gotowe. Sterowanie: RAMIE.ustaw(obrot, bark, lokiec, nadgarstek, obrot_chw, rozwarcie)"
+                             " lub RAMIE.poza('probka')\n")

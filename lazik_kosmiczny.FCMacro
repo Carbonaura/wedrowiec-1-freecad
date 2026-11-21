@@ -1,0 +1,369 @@
+# -*- coding: utf-8 -*-
+# =============================================================================
+#  ŁAZIK KOSMICZNY "WĘDROWIEC-1"  –  makro FreeCAD (testowane na FreeCAD 1.1)
+# -----------------------------------------------------------------------------
+#  4 koła z bieżnikiem, zawieszenie typu "rocker" z silnikami skrętu,
+#  5-osiowe ramię robotyczne zamontowane na pokładzie, maszt z głowicą kamer,
+#  antena paraboliczna, panel słoneczny, RTG (zasilacz radioizotopowy),
+#  kamery nawigacyjne/HAZCAM, opcjonalnie teren marsjański ze skałą.
+#
+#  Uruchomienie:  Makro -> Makra... -> wskaż ten plik -> Wykonaj
+#  Jednostki: milimetry.  Osie: X = przód, Y = lewo, Z = góra.
+# =============================================================================
+
+import math
+import os
+import FreeCAD as App
+import Part
+
+# ------------------------------- PARAMETRY ----------------------------------
+NAZWA_DOKUMENTU = "Lazik_Kosmiczny"
+
+POZA_RAMIENIA = "probka"     # "probka", "transport", "wyprostowane", "prezentacja"
+POKAZ_TEREN = True           # podłoże + skała pod chwytakiem
+ANIMACJA = False             # True = ramię płynnie przechodzi między pozami (tylko GUI)
+
+# Korpus
+KORPUS_DL, KORPUS_SZ, KORPUS_WYS = 1200.0, 700.0, 300.0
+PRZESWIT = 350.0                         # spód korpusu nad gruntem
+
+# Koła
+R_OPONY = 210.0
+SZER_KOLA = 160.0
+WYS_BIEZNIKA = 12.0
+LICZBA_BIEZNIKOW = 24
+ROZSTAW_X = 450.0                        # oś koła od środka (przód/tył)
+KOLO_Y = 520.0                           # środek koła od osi symetrii (bok)
+KOLO_Z = R_OPONY + WYS_BIEZNIKA          # koło stoi na z = 0
+ROCKER_Y = 395.0                         # płaszczyzna wahaczy
+
+# Ramię (współrzędne podstawy na pokładzie; geometria w ramie_robotyczne.FCMacro)
+RAMIE_BAZA = (330.0, -160.0)             # położenie podstawy na pokładzie (x, y)
+
+# Kolory (R, G, B) 0..1
+BIALY = (0.92, 0.92, 0.90)
+SZARY = (0.55, 0.56, 0.58)
+CIEMNY = (0.18, 0.18, 0.20)
+ALU = (0.75, 0.76, 0.78)
+ZLOTO = (0.85, 0.65, 0.13)
+CZARNY = (0.05, 0.05, 0.06)
+OGNIWA = (0.05, 0.12, 0.40)
+POMARANCZ = (0.95, 0.45, 0.05)
+MARS = (0.72, 0.42, 0.25)
+SKALA = (0.45, 0.30, 0.22)
+CZERWONY = (0.80, 0.10, 0.10)
+
+POKLAD_Z = PRZESWIT + KORPUS_WYS + 15.0  # górna powierzchnia płyty pokładu
+
+# ------------------------------ NARZĘDZIA -----------------------------------
+def V(x, y, z):
+    return App.Vector(x, y, z)
+
+
+def skrzynka(lx, ly, lz, cx, cy, cz, zaokr=0.0):
+    """Prostopadłościan o środku (cx, cy, cz), opcjonalnie z zaokrąglonymi krawędziami."""
+    b = Part.makeBox(lx, ly, lz, V(cx - lx / 2, cy - ly / 2, cz - lz / 2))
+    if zaokr > 0:
+        try:
+            b = b.makeFillet(zaokr, b.Edges)
+        except Exception:
+            pass
+    return b
+
+
+def walec(r, p1, p2):
+    """Walec o promieniu r od punktu p1 do p2."""
+    d = p2 - p1
+    return Part.makeCylinder(r, d.Length, p1, App.Vector(d).normalize())
+
+
+def belka(p1, p2, w, h):
+    """Belka prostokątna (szer. w, wys. h) od p1 do p2."""
+    d = p2 - p1
+    b = Part.makeBox(d.Length, w, h, V(0, -w / 2, -h / 2))
+    b.Placement = App.Placement(p1, App.Rotation(V(1, 0, 0), d))
+    return b
+
+
+def scal(ksztalty):
+    """Suma boolowska listy brył (z awaryjnym compoundem)."""
+    ksztalty = [k for k in ksztalty if k is not None]
+    if len(ksztalty) == 1:
+        return ksztalty[0]
+    try:
+        wynik = ksztalty[0].fuse(ksztalty[1:])
+        return wynik.removeSplitter()
+    except Exception:
+        return Part.makeCompound(ksztalty)
+
+
+# ------------------------------- DOKUMENT -----------------------------------
+if NAZWA_DOKUMENTU in App.listDocuments():
+    App.closeDocument(NAZWA_DOKUMENTU)
+doc = App.newDocument(NAZWA_DOKUMENTU)
+
+grupy = {}
+
+
+def grupa(nazwa):
+    if nazwa not in grupy:
+        grupy[nazwa] = doc.addObject("App::DocumentObjectGroup", nazwa)
+    return grupy[nazwa]
+
+
+def dodaj(nazwa, ksztalt, kolor, grp, placement=None, przezr=0):
+    obj = doc.addObject("Part::Feature", nazwa)
+    obj.Shape = ksztalt
+    if placement is not None:
+        obj.Placement = placement
+    grupa(grp).addObject(obj)
+    if App.GuiUp:
+        obj.ViewObject.ShapeColor = kolor
+        obj.ViewObject.Transparency = przezr
+    return obj
+
+
+# =============================================================================
+#  1. KORPUS
+# =============================================================================
+zk = PRZESWIT + KORPUS_WYS / 2
+dodaj("Korpus", skrzynka(KORPUS_DL, KORPUS_SZ, KORPUS_WYS, 0, 0, zk, 25), BIALY, "Korpus")
+dodaj("Plyta_pokladu",
+      skrzynka(KORPUS_DL - 20, KORPUS_SZ - 20, 15, 0, 0, POKLAD_Z - 7.5, 4), SZARY, "Korpus")
+
+# Złota folia izolacyjna (MLI) na bokach
+folia = []
+for s in (1, -1):
+    folia.append(skrzynka(1040, 8, 230, 0, s * (KORPUS_SZ / 2 + 3), zk, 2))
+folia.append(skrzynka(8, 560, 200, -KORPUS_DL / 2 - 3, 0, zk, 2))
+dodaj("Folia_MLI", scal(folia), ZLOTO, "Korpus")
+
+# Przednia listwa z kamerami HAZCAM i reflektorami
+xf = KORPUS_DL / 2
+listwa = skrzynka(40, 360, 70, xf + 15, 0, PRZESWIT + 70, 8)
+dodaj("Listwa_HAZCAM", listwa, CIEMNY, "Korpus")
+obiektywy = []
+for y in (-120, -60, 60, 120):
+    obiektywy.append(walec(16, V(xf + 30, y, PRZESWIT + 70), V(xf + 48, y, PRZESWIT + 70)))
+dodaj("Obiektywy_HAZCAM", scal(obiektywy), CZARNY, "Korpus")
+lampy = [walec(22, V(xf - 5, s * 260, PRZESWIT + 220), V(xf + 18, s * 260, PRZESWIT + 220))
+         for s in (1, -1)]
+dodaj("Reflektory", scal(lampy), (1.0, 0.95, 0.7), "Korpus")
+
+# Akcenty – pomarańczowe uchwyty transportowe na narożnikach pokładu
+uchwyty = []
+for sx in (1, -1):
+    for sy in (1, -1):
+        cx, cy = sx * (KORPUS_DL / 2 - 30), sy * (KORPUS_SZ / 2 - 30)
+        uchwyty.append(walec(18, V(cx, cy, POKLAD_Z), V(cx, cy, POKLAD_Z + 30)))
+dodaj("Uchwyty", scal(uchwyty), POMARANCZ, "Korpus")
+
+# =============================================================================
+#  2. ZAWIESZENIE  (wahacze + słupki skrętne + silniki w piastach)
+# =============================================================================
+for s, strona in ((1, "L"), (-1, "P")):
+    yR = s * ROCKER_Y
+    piv = V(0, yR, PRZESWIT + 150)
+    czesci = [walec(55, V(0, s * KORPUS_SZ / 2, piv.z), V(0, s * (ROCKER_Y + 35), piv.z))]
+    silniki = []
+    for sx in (1, -1):
+        gora = V(sx * ROZSTAW_X, yR, KOLO_Z + 210)
+        kolano = V(sx * ROZSTAW_X * 0.55, yR, PRZESWIT + 110)
+        czesci.append(belka(piv, kolano, 55, 70))
+        czesci.append(belka(kolano, gora, 55, 70))
+        czesci.append(Part.makeSphere(40, kolano))           # przegub kolana
+        # słupek skrętu
+        czesci.append(walec(30, gora + V(0, 0, 20), V(sx * ROZSTAW_X, yR, KOLO_Z)))
+        # silnik skrętu (na górze słupka) i silnik w piaście
+        silniki.append(walec(48, gora - V(0, 0, 10), gora + V(0, 0, 70)))
+        silniki.append(walec(62, V(sx * ROZSTAW_X, yR - s * 20, KOLO_Z),
+                             V(sx * ROZSTAW_X, s * (KOLO_Y - SZER_KOLA / 2 + 10), KOLO_Z)))
+    dodaj("Wahacz_" + strona, scal(czesci), ALU, "Zawieszenie")
+    dodaj("Silniki_" + strona, scal(silniki), CIEMNY, "Zawieszenie")
+
+# =============================================================================
+#  3. KOŁA  (bieżnik typu grouser, zagłębiona felga, szprychy)
+# =============================================================================
+def kolo(s):
+    """Koło z osią wzdłuż Y, środek w (0,0,0); s = +1 lewe, -1 prawe (kołpak na zewnątrz)."""
+    W = SZER_KOLA
+    opona = Part.makeCylinder(R_OPONY, W, V(0, -W / 2, 0), V(0, 1, 0))
+    # zagłębienie felgi od strony zewnętrznej
+    gl = 45.0
+    y0 = W / 2 - gl if s > 0 else -W / 2
+    opona = opona.cut(Part.makeCylinder(R_OPONY - 22, gl, V(0, y0, 0), V(0, 1, 0)))
+    # bieżnik
+    bieznik = []
+    for i in range(LICZBA_BIEZNIKOW):
+        g = Part.makeBox(18, W, WYS_BIEZNIKA + 3, V(-9, -W / 2, R_OPONY - 3))
+        g.rotate(V(0, 0, 0), V(0, 1, 0), i * 360.0 / LICZBA_BIEZNIKOW)
+        bieznik.append(g)
+    # szprychy w zagłębieniu
+    yc = s * (W / 2 - gl)
+    for i in range(6):
+        sp = Part.makeBox(R_OPONY - 30, 14, 22, V(0, yc - 7, -11))
+        sp.rotate(V(0, 0, 0), V(0, 1, 0), i * 60.0 + 15)
+        bieznik.append(sp)
+    return scal([opona] + bieznik)
+
+
+def kolpak(s):
+    W = SZER_KOLA
+    yc = s * (W / 2 - 45)
+    return Part.makeCylinder(55, 50, V(0, yc, 0), V(0, s, 0))
+
+
+for sx, przod in ((1, "Przod"), (-1, "Tyl")):
+    for s, strona in ((1, "L"), (-1, "P")):
+        pl = App.Placement(V(sx * ROZSTAW_X, s * KOLO_Y, KOLO_Z), App.Rotation())
+        dodaj("Kolo_%s_%s" % (przod, strona), kolo(s), ALU, "Kola", pl)
+        dodaj("Kolpak_%s_%s" % (przod, strona), kolpak(s), POMARANCZ, "Kola", pl)
+
+# =============================================================================
+#  4. ZASILANIE  (panel słoneczny + RTG)
+# =============================================================================
+PX0, PX1, PY = -570.0, 90.0, 250.0
+PZ = POKLAD_Z + 45.0
+wsporniki = [walec(15, V(x, y, POKLAD_Z), V(x, y, PZ))
+             for x in (PX0 + 40, PX1 - 40) for y in (-PY + 40, PY - 40)]
+rama = skrzynka(PX1 - PX0, 2 * PY, 14, (PX0 + PX1) / 2, 0, PZ + 7, 3)
+dodaj("Panel_rama", scal(wsporniki + [rama]), SZARY, "Zasilanie")
+nx, ny, odst = 7, 5, 8.0
+cw = (PX1 - PX0 - (nx + 1) * odst) / nx
+ch = (2 * PY - (ny + 1) * odst) / ny
+ogniwa = []
+for i in range(nx):
+    for j in range(ny):
+        cx = PX0 + odst + cw / 2 + i * (cw + odst)
+        cy = -PY + odst + ch / 2 + j * (ch + odst)
+        ogniwa.append(Part.makeBox(cw, ch, 3, V(cx - cw / 2, cy - ch / 2, PZ + 14)))
+dodaj("Panel_ogniwa", Part.makeCompound(ogniwa), OGNIWA, "Zasilanie")
+
+# RTG – walec z żebrami, odchylony do tyłu i w górę
+rtg_len, rtg_r = 380.0, 85.0
+rtg = [Part.makeCylinder(rtg_r, rtg_len, V(0, 0, 0), V(1, 0, 0))]
+for i in range(8):
+    f = Part.makeBox(rtg_len - 40, 6, 80, V(20, -3, rtg_r - 10))
+    f.rotate(V(0, 0, 0), V(1, 0, 0), i * 45.0 + 22.5)
+    rtg.append(f)
+rtg.append(Part.makeCylinder(rtg_r + 10, 20, V(-10, 0, 0), V(1, 0, 0)))
+rtg.append(Part.makeCylinder(rtg_r + 10, 20, V(rtg_len - 10, 0, 0), V(1, 0, 0)))
+pl_rtg = App.Placement(V(-KORPUS_DL / 2 - 70, 0, PRZESWIT + 200),
+                       App.Rotation(V(0, 0, 1), 180).multiply(App.Rotation(V(0, 1, 0), 30)))
+dodaj("RTG", scal(rtg), CIEMNY, "Zasilanie", pl_rtg)
+mocowanie = [belka(V(-KORPUS_DL / 2 + 5, y, PRZESWIT + 120), V(-KORPUS_DL / 2 - 90, y * 0.4, PRZESWIT + 190), 20, 20)
+             for y in (-180, 180)]
+mocowanie += [belka(V(-KORPUS_DL / 2 + 5, y, PRZESWIT + 260), V(-KORPUS_DL / 2 - 90, y * 0.4, PRZESWIT + 200), 20, 20)
+              for y in (-180, 180)]
+dodaj("RTG_mocowanie", scal(mocowanie), ALU, "Zasilanie")
+
+# =============================================================================
+#  5. MASZT Z GŁOWICĄ KAMER
+# =============================================================================
+MX, MY, MH = 470.0, 230.0, 720.0
+maszt = [walec(70, V(MX, MY, POKLAD_Z), V(MX, MY, POKLAD_Z + 70)),
+         walec(38, V(MX, MY, POKLAD_Z), V(MX, MY, POKLAD_Z + MH)),
+         walec(55, V(MX, MY, POKLAD_Z + MH - 20), V(MX, MY, POKLAD_Z + MH + 30))]
+dodaj("Maszt", scal(maszt), BIALY, "Maszt")
+gz = POKLAD_Z + MH + 110
+glowica = [skrzynka(150, 320, 130, MX + 10, MY, gz, 12),
+           walec(30, V(MX, MY - 175, gz), V(MX, MY + 175, gz))]   # oś pochylenia
+dodaj("Glowica_kamer", scal(glowica), SZARY, "Maszt")
+szyby = [walec(26, V(MX + 80, MY + y, gz - 20), V(MX + 105, MY + y, gz - 20)) for y in (-110, -55, 55, 110)]
+szyby.append(walec(46, V(MX + 80, MY, gz + 25), V(MX + 115, MY, gz + 25)))   # "ChemCam"
+dodaj("Obiektywy_maszt", scal(szyby), CZARNY, "Maszt")
+dodaj("Lampka_maszt", Part.makeSphere(12, V(MX - 60, MY + 140, gz + 65)), CZERWONY, "Maszt")
+
+# =============================================================================
+#  6. ANTENA PARABOLICZNA (HGA)  +  antena dookólna (LGA)
+# =============================================================================
+AX, AY = -470.0, 290.0
+slup_h = 300.0
+dodaj("Antena_slup", scal([walec(60, V(AX, AY, POKLAD_Z), V(AX, AY, POKLAD_Z + 40)),
+                            walec(25, V(AX, AY, POKLAD_Z), V(AX, AY, POKLAD_Z + slup_h)),
+                            Part.makeSphere(45, V(AX, AY, POKLAD_Z + slup_h))]), ALU, "Antena")
+
+R_CZASZY, OGN, GR = 170.0, 110.0, 6.0
+zew = [V(r, 0, r * r / (4 * OGN)) for r in [R_CZASZY * k / 16.0 for k in range(17)]]
+wew = [V(p.x, 0, p.z + GR) for p in reversed(zew)]
+profil = Part.makePolygon(zew + wew + [zew[0]])
+czasza = Part.Face(profil).revolve(V(0, 0, 0), V(0, 0, 1), 360)
+zmax = R_CZASZY ** 2 / (4 * OGN)
+dysza = [walec(4, V(R_CZASZY * math.cos(a), R_CZASZY * math.sin(a), zmax), V(0, 0, OGN))
+         for a in [math.radians(d) for d in (90, 210, 330)]]
+dysza.append(Part.makeCylinder(18, 30, V(0, 0, OGN - 10)))
+dysza.append(walec(20, V(0, 0, -45), V(0, 0, 5)))
+pl_ant = App.Placement(V(AX, AY, POKLAD_Z + slup_h + 40),
+                       App.Rotation(V(0, 0, 1), 35).multiply(App.Rotation(V(0, 1, 0), 40)))
+dodaj("Antena_czasza", czasza, BIALY, "Antena", pl_ant)
+dodaj("Antena_zasilacz", scal(dysza), SZARY, "Antena", pl_ant)
+dodaj("Antena_LGA", scal([walec(10, V(-520, -270, POKLAD_Z), V(-520, -270, POKLAD_Z + 260)),
+                          Part.makeCone(30, 5, 60, V(-520, -270, POKLAD_Z + 260))]), SZARY, "Antena")
+
+# =============================================================================
+#  7. RAMIĘ ROBOTYCZNE  (moduł ramie_robotyczne.FCMacro)
+# =============================================================================
+try:
+    _kat = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    _kat = os.path.join(os.path.expanduser("~"), "CAD")
+_ramie_plik = os.path.join(_kat, "ramie_robotyczne.FCMacro")
+if not os.path.isfile(_ramie_plik):
+    _ramie_plik = "/home/budyneater/CAD/ramie_robotyczne.FCMacro"
+
+_mod = {"RAMIE_JAKO_MODUL": True, "__file__": _ramie_plik}
+with open(_ramie_plik, "r", encoding="utf-8") as _f:
+    exec(compile(_f.read(), _ramie_plik, "exec"), _mod)
+
+RAMIE = _mod["zbuduj_ramie"](
+    doc,
+    baza=App.Placement(V(RAMIE_BAZA[0], RAMIE_BAZA[1], POKLAD_Z), App.Rotation()),
+    poza=POZA_RAMIENIA,
+    prefiks="R_",
+)
+
+
+def ustaw_ramie(*args, **kwargs):
+    """Ustawia ramię (obrot, bark, lokiec, nadgarstek, obrot_chw, rozwarcie)."""
+    return RAMIE.ustaw(*args, **kwargs)
+
+# =============================================================================
+#  8. TEREN  (opcjonalnie) – skała ląduje dokładnie pod chwytakiem
+# =============================================================================
+if POKAZ_TEREN:
+    dodaj("Grunt", Part.makeBox(5000, 4000, 20, V(-2500, -2000, -20)), MARS, "Teren")
+    tip = RAMIE.punkt_chwytu()
+
+    def skala(r, sx, sy, sz, poz, obrot=0):
+        sf = Part.makeSphere(r)
+        m = App.Matrix()
+        m.scale(sx, sy, sz)
+        sf = sf.transformGeometry(m)
+        sf.rotate(V(0, 0, 0), V(0, 0, 1), obrot)
+        sf.translate(poz)
+        return sf
+
+    skaly = []
+    if POZA_RAMIENIA == "probka":
+        skaly.append(skala(60, 1.3, 0.9, 0.9, V(tip.x, tip.y, 0), 20))
+    for (x, y, r, k) in ((1500, 700, 120, 10), (-900, -1100, 160, 40), (1900, -900, 90, 70),
+                         (-1800, 900, 200, 5), (700, 1300, 70, 0)):
+        skaly.append(skala(r, 1.4, 1.0, 0.6, V(x, y, 0), k))
+    dodaj("Skaly", Part.makeCompound(skaly), SKALA, "Teren")
+
+# =============================================================================
+#  9. WIDOK + ANIMACJA
+# =============================================================================
+doc.recompute()
+
+if App.GuiUp:
+    import FreeCADGui as Gui
+    Gui.SendMsgToActiveView("ViewFit")
+    Gui.activeDocument().activeView().viewIsometric()
+    Gui.SendMsgToActiveView("ViewFit")
+
+    if ANIMACJA:
+        RAMIE.animuj()
+        App.Console.PrintMessage("Animacja ramienia: zatrzymaj wpisując RAMIE.zatrzymaj()\n")
+
+App.Console.PrintMessage("Lazik kosmiczny gotowy! Zmien poze: RAMIE.ustaw(obrot, bark, lokiec, nadgarstek, obrot_chw, rozwarcie) lub RAMIE.poza('probka')\n")
